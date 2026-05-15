@@ -4,52 +4,43 @@ Import-Module Microsoft.Graph.Authentication
 # Connect to Graph
 Connect-MgGraph -NoWelcome
 
-function Get-DeviceConfigurationPolicyAssignment() {
+function Get-DeviceConfigurationPolicyAssignment {
     <#
-        .SYNOPSIS
-        This function is used to dynamically get device configuration policy assignment from the Graph API REST interface
+    .SYNOPSIS
+    This function is used to dynamically get device configuration policy assignment from the Graph API REST interface.
 
-        .DESCRIPTION
-        The function connects to the Graph API Interface and dynamically gets any device configuration policy assignment
+    .DESCRIPTION
+    The function connects to the Graph API Interface and dynamically gets any device configuration policy assignment.
+    Uses Get-EntraGroup to resolve group details and Graph batch requests for performance.
 
-        .PARAMETER id
-        Enter id (guid) for the Device Configuration Policy you want to check assignment (optional - if not provided, gets all policies)
+    .PARAMETER Id
+    Enter id (guid) for the Device Configuration Policy you want to check assignment.
 
-        .PARAMETER Category
-        Category of policy (AutopilotProfile, ApplicationProtection, ConditionalAccess, CompliancePolicies, DeviceConfiguration, SettingsCatalog, etc)
+    .PARAMETER Category
+    Category of policy (AutopilotProfile, ApplicationProtection, ConditionalAccess, CompliancePolicies, DeviceConfiguration, DeviceConfigurationSC).
 
-        .PARAMETER Name
-        Optional filter by policy name
+    .EXAMPLE
+    Get-DeviceConfigurationPolicyAssignment -Category "DeviceConfiguration"
 
-        .EXAMPLE
-        Get-DeviceConfigurationPolicyAssignment -Category "DeviceConfiguration"
-        Returns all device configuration policies and their assignments
+    .EXAMPLE
+    Get-DeviceConfigurationPolicyAssignment -Id "12345678-1234-1234-1234-123456789012" -Category "DeviceConfiguration"
 
-        .EXAMPLE
-        Get-DeviceConfigurationPolicyAssignment -id "12345678-1234-1234-1234-123456789012" -Category "DeviceConfiguration"
-        Returns assignments for a specific device configuration policy
-
-        .NOTES
-        NAME: Get-DeviceConfigurationPolicyAssignment
-        Author: Hailey Phillips
-        Version: 0.0.1
-        Modified: 2025-07-23
-
-        Adapted from Intune management functions by Andrew Taylor (https://github.com/andrew-s-taylor/public).
+    .NOTES
+    NAME: Get-DeviceConfigurationPolicyAssignment
     #>
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $false, HelpMessage = "Enter id (guid) for the Device Configuration Policy you want to check assignment")]
-        $id,
-
         [Parameter(Mandatory = $true)]
-        [ValidateSet('AutopilotProfile', 'ApplicationProtection', 'ConditionalAccess', 'CompliancePolicies', 'DeviceConfiguration', 'DeviceConfigurationSC', '*')]
-        [string]$Category
+        [ValidateSet('AutopilotProfile', 'ApplicationProtection', 'ConditionalAccess', 'CompliancePolicies', 'DeviceConfiguration', 'DeviceConfigurationSC')]
+        [string]$Category,
+
+        [Parameter(Mandatory = $false, ValueFromPipelineByPropertyName = $true)]
+        [ValidateScript({ $_ -match '^([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})$' })]
+        [string]$Id
     )
 
     $graphApiVersion = "beta"
 
-    # Dynamically setting Graph resource path based off of category
     $DCP_resource = switch ($Category) {
         'AutopilotProfile' { "deviceManagement/windowsAutopilotDeploymentProfiles" }
         'ApplicationProtection' { "deviceAppManagement/managedAppPolicies" }
@@ -57,13 +48,6 @@ function Get-DeviceConfigurationPolicyAssignment() {
         'ConditionalAccess' { "identity/conditionalAccess/policies" }
         'DeviceConfiguration' { "deviceManagement/deviceConfigurations" }
         'DeviceConfigurationSC' { "deviceManagement/configurationPolicies" }
-        default { throw "Unknown category: $Category" }
-    }
-
-    # Set assignment endpoint based on category
-    $assignmentEndpoint = switch ($Category) {
-        'DeviceConfiguration' { "groupAssignments" }
-        default { "assignments" }
     }
 
     $displayNameProperty = switch ($Category) {
@@ -72,116 +56,181 @@ function Get-DeviceConfigurationPolicyAssignment() {
     }
 
     try {
-        # If specific ID is provided, get assignments for that policy only
-        if ($id) {
-            $uri = "https://graph.microsoft.com/$graphApiVersion/$($DCP_resource)/$id/$assignmentEndpoint"
-            $PolicyAssignments = (Invoke-MgGraphRequest -Uri $uri -Method Get -OutputType PSObject).Value
-            $AssignedGroups = @()
+        if ($Id) {
+            $graphParams = @{
+                Uri        = "https://graph.microsoft.com/$graphApiVersion/$DCP_resource/$Id/assignments"
+                Method     = "GET"
+                OutputType = "PSObject"
+            }
 
+            $PolicyAssignments = (Invoke-MgGraphRequest @graphParams).Value
+
+            # Build group lookup table upfront from unique group IDs
+            $GroupTable = @{}
             foreach ($Assignment in $PolicyAssignments) {
-                # Handle different assignment structures based on category
-                $GroupId = switch ($Category) {
-                    'DeviceConfiguration' { $Assignment.targetGroupId }
-                    default { $Assignment.target.groupId }
-                }
-
-                if ($GroupId) {
+                $GroupId = $Assignment.target.groupId
+                if ($GroupId -and -not $GroupTable.ContainsKey($GroupId)) {
                     try {
-                        $GroupDetails = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/groups/$($GroupId)" -OutputType PSObject
-                        $AssignedGroups += [PSCustomObject]@{
-                            Id           = $GroupId
-                            Name         = $GroupDetails.displayName
-                            Description  = $GroupDetails.description
-                            ExcludeGroup = $Assignment.excludeGroup
-                        }
-                        Write-Host "Policy is assigned to: $($GroupDetails.displayName)" -Level Info
+                        $GroupTable[$GroupId] = Get-EntraGroup -GroupId $GroupId
                     } catch {
-                        Write-Log "Unable to get details for group ID: $GroupId" -Level Warning
+                        Write-Log -Message "Group '$GroupId' not found — may have been deleted" -Severity Warn
+                        $GroupTable[$GroupId] = $null
                     }
                 }
             }
-            return $AssignedGroups
-        }
-        # If no ID provided, get all policies of this type and their assignments
-        else {
-            $uri = "https://graph.microsoft.com/$graphApiVersion/$($DCP_resource)"
-            $AllPolicies = (Invoke-MgGraphRequest -Uri $uri -Method Get -OutputType PSObject).Value
 
-            $PolicyResults = @()
+            Write-Log -Message "Resolved $($GroupTable.Count) unique group(s) for $Category policy" -Severity Info
+
+            # Build assignments using the group lookup table
+            $AssignedGroups = [ordered]@{}
+            foreach ($Assignment in $PolicyAssignments) {
+                $GroupId = $Assignment.target.groupId
+
+                if ($GroupId -and -not $AssignedGroups.Contains($GroupId)) {
+                    $GroupDetails = $GroupTable[$GroupId]
+
+                    $AssignmentType = switch ($Assignment.target.'@odata.type') {
+                        '#microsoft.graph.exclusionGroupAssignmentTarget' { "Exclude" }
+                        default { "Include" }
+                    }
+
+                    $AssignedGroups[$GroupId] = [PSCustomObject]@{
+                        Id             = $GroupId
+                        Name           = if ($GroupDetails) { $GroupDetails.displayName } else { "Deleted Group" }
+                        Description    = if ($GroupDetails) { $GroupDetails.description } else { $null }
+                        AssignmentType = $AssignmentType
+                        Intent         = $Assignment.intent
+                        Source         = $Assignment.source
+                        SourceId       = $Assignment.sourceId
+                        FilterId       = $Assignment.target.deviceAndAppManagementAssignmentFilterId
+                        FilterType     = $Assignment.target.deviceAndAppManagementAssignmentFilterType
+                    }
+                }
+            }
+
+            return $AssignedGroups.Values
+
+        } else {
+            $graphParams = @{
+                Uri        = "https://graph.microsoft.com/$graphApiVersion/$DCP_resource"
+                Method     = "GET"
+                OutputType = "PSObject"
+            }
+
+            $AllPolicies = (Invoke-MgGraphRequest @graphParams).Value
+            Write-Log -Message "Retrieving assignments for $($AllPolicies.Count) $Category policies" -Severity Info
+
+            # Build batch requests
+            $batches = [System.Collections.Generic.List[object]]::new()
+            $batchRequests = [System.Collections.Generic.List[object]]::new()
+            $batchIndex = 1
+
             foreach ($Policy in $AllPolicies) {
-                # Get assignments for each policy
-                $assignmentUri = "https://graph.microsoft.com/$graphApiVersion/$($DCP_resource)/$($Policy.id)/$assignmentEndpoint"
-                try {
-                    $PolicyAssignments = (Invoke-MgGraphRequest -Uri $assignmentUri -Method Get -OutputType PSObject).Value
-                    $AssignedGroups = @()
+                $batchRequests.Add(@{
+                        id     = "$batchIndex"
+                        method = "GET"
+                        url    = "/$DCP_resource/$($Policy.id)/assignments"
+                    })
 
-                    foreach ($Assignment in $PolicyAssignments) {
-                        $GroupId = switch ($Category) {
-                            'DeviceConfiguration' { $Assignment.targetGroupId }
-                            default { $Assignment.target.groupId }
-                        }
+                if ($batchRequests.Count -eq 20) {
+                    $batches.Add($batchRequests.ToArray())
+                    $batchRequests = [System.Collections.Generic.List[object]]::new()
+                }
 
-                        if ($GroupId) {
+                $batchIndex++
+            }
+
+            if ($batchRequests.Count -gt 0) {
+                $batches.Add($batchRequests.ToArray())
+            }
+
+            # Execute batch requests
+            $allResponses = [System.Collections.Generic.List[object]]::new()
+            foreach ($batch in $batches) {
+                $batchParams = @{
+                    Uri         = "https://graph.microsoft.com/$graphApiVersion/`$batch"
+                    Method      = "POST"
+                    Body        = (@{ requests = $batch } | ConvertTo-Json -Depth 5)
+                    ContentType = "application/json"
+                    OutputType  = "PSObject"
+                }
+                $batchResponse = Invoke-MgGraphRequest @batchParams
+                $allResponses.AddRange($batchResponse.responses)
+            }
+
+            # Build group lookup table upfront from all unique group IDs across all policies
+            $GroupTable = @{}
+            foreach ($response in $allResponses) {
+                if ($response.status -eq 200) {
+                    foreach ($Assignment in $response.body.value) {
+                        $GroupId = $Assignment.target.groupId
+                        if ($GroupId -and -not $GroupTable.ContainsKey($GroupId)) {
                             try {
-                                $GroupDetails = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/groups/$($GroupId)" -OutputType PSObject
-                                $AssignedGroups += [PSCustomObject]@{
-                                    Id          = $GroupId
-                                    Name        = $GroupDetails.displayName
-                                    Description = $GroupDetails.description
-                                    TargetType  = $Assignment.target.'@odata.type' -or 'groupAssignmentTarget'
-                                }
-                                Write-Host "Policy is assigned to: $($GroupDetails.displayName)"
+                                $GroupTable[$GroupId] = Get-EntraGroup -GroupId $GroupId
                             } catch {
-                                Write-Log "Unable to get details for group ID: $GroupId" -Level Warning
+                                Write-Log -Message "Group '$GroupId' not found — may have been deleted" -Severity Warn
+                                $GroupTable[$GroupId] = $null
                             }
                         }
                     }
-
-                    $PolicyResults += [PSCustomObject]@{
-                        PolicyId          = $Policy.id
-                        PolicyName        = $Policy.$displayNameProperty
-                        PolicyDescription = $Policy.description
-                        Category          = $Category
-                        AssignedGroups    = $AssignedGroups.Name
-                        AssignmentCount   = $AssignedGroups.Count
-                    }
-                } catch {
-                    if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
-                        Write-Log "Unable to get assignments for policy: $($Policy.$displayNameProperty)" -Level Warning
-                    }
                 }
             }
-            return $PolicyResults
+
+            Write-Log -Message "Resolved $($GroupTable.Count) unique group(s) across all $Category policies" -Severity Info
+
+            # Map responses back to policies using the group lookup table
+            $PolicyResults = [ordered]@{}
+            for ($i = 0; $i -lt $AllPolicies.Count; $i++) {
+                $Policy = $AllPolicies[$i]
+                $response = $allResponses | Where-Object id -EQ "$($i + 1)"
+
+                $AssignedGroups = [ordered]@{}
+
+                if ($response.status -eq 200) {
+                    foreach ($Assignment in $response.body.value) {
+                        $GroupId = $Assignment.target.groupId
+
+                        if ($GroupId -and -not $AssignedGroups.Contains($GroupId)) {
+                            $GroupDetails = $GroupTable[$GroupId]
+
+                            $AssignmentType = switch ($Assignment.target.'@odata.type') {
+                                '#microsoft.graph.exclusionGroupAssignmentTarget' { "Exclude" }
+                                default { "Include" }
+                            }
+
+                            $AssignedGroups[$GroupId] = [PSCustomObject]@{
+                                Id             = $GroupId
+                                Name           = if ($GroupDetails) { $GroupDetails.displayName } else { "Deleted Group" }
+                                Description    = if ($GroupDetails) { $GroupDetails.description } else { $null }
+                                AssignmentType = $AssignmentType
+                                Intent         = $Assignment.intent
+                                Source         = $Assignment.source
+                                SourceId       = $Assignment.sourceId
+                                FilterId       = $Assignment.target.deviceAndAppManagementAssignmentFilterId
+                                FilterType     = $Assignment.target.deviceAndAppManagementAssignmentFilterType
+                            }
+                        }
+                    }
+                } else {
+                    Write-Log -Message "Failed to retrieve assignments for policy: $($Policy.$displayNameProperty)" -Severity Warn
+                }
+
+                $PolicyResults[$Policy.id] = [PSCustomObject]@{
+                    PolicyId          = $Policy.id
+                    PolicyName        = $Policy.$displayNameProperty
+                    PolicyDescription = $Policy.description
+                    Category          = $Category
+                    AssignedGroups    = $AssignedGroups.Values
+                    AssignmentCount   = $AssignedGroups.Count
+                }
+            }
+
+            Write-Log -Message "Retrieved assignments for $($PolicyResults.Count) $Category policies" -Severity Info
+            return $PolicyResults.Values
         }
+
     } catch {
-        $ex = $_.Exception
-        $responseBody = ""
-
-        # Check if we have a response and response stream
-        if ($ex.Response -and $ex.Response.GetResponseStream) {
-            try {
-                $errorResponse = $ex.Response.GetResponseStream()
-                if ($errorResponse) {
-                    $reader = New-Object System.IO.StreamReader($errorResponse)
-                    $reader.BaseStream.Position = 0
-                    $reader.DiscardBufferedData()
-                    $responseBody = $reader.ReadToEnd()
-                }
-            } catch {
-                $responseBody = "Unable to read error response stream"
-            }
-        }
-
-        if ($responseBody) {
-            Write-Host "Response content:`n$responseBody" -f Red
-        }
-
-        if ($ex.Response) {
-            Write-Error "Request to $Uri failed with HTTP Status $($ex.Response.StatusCode) $($ex.Response.StatusDescription)"
-        } else {
-            Write-Error "Request failed: $($ex.Message)"
-        }
-        Write-Host
-        break
+        Write-Log -Message "Error retrieving $Category policy assignments" -Severity Error
+        throw
     }
-} # end function Get-DeviceConfigurationPolicyAssignment
+}   # end function Get-DeviceConfigurationPolicyAssignment

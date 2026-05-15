@@ -4,18 +4,18 @@
 
 | Shortcut | Description |
 | --- | --- |
-| ⌘ + ⌥ + ↓ | add a new cursor below |
-| ⌥ + Click | add a new cursor at the mouse click |
-| ⌘ + ⇧ + L | add new cursor behind all instances of a word |
+| cmd + opt + ↓ | add a new cursor below |
+| opt + Click | add a new cursor at the mouse click |
+| cmd + ⇧ + L | add new cursor behind all instances of a word |
 
 ## Split editor
 
 | Shortcut | Description |
 | --- | --- |
-| ⌘ + \ | split |
+| cmd + \ | split |
 
 ## Comments 
 
 | Shortcut | Description |
 | --- | --- |
-| ⌘ + / | Comments entire VS Code selection with single-line comments
+| cmd + / | Comments entire VS Code selection with single-line comments

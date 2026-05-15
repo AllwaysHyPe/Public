@@ -7,48 +7,39 @@ Connect-MgGraph -NoWelcome
 
 function Get-DeviceConfigurationPolicy {
     <#
-        .SYNOPSIS
-        This function is used to dynamically get device configuration policy from the Graph API REST interface
+    .SYNOPSIS
+    This function is used to dynamically get device configuration policy from the Graph API REST interface.
 
-        .DESCRIPTION
-        The function connects to the Graph API Interface and dynamically gets any device configuration policies
+    .DESCRIPTION
+    The function connects to the Graph API Interface and dynamically gets any device configuration policies.
 
-        .PARAMETER Category
-        Category of policy (AutopilotProfile, ApplicationProtection, ConditionalAccess, CompliancePolicies, DeviceConfiguration, SettingsCatalog, etc)
+    .PARAMETER Category
+    Category of policy (AutopilotProfile, ApplicationProtection, ConditionalAccess, CompliancePolicies, DeviceConfiguration, DeviceConfigurationSC).
 
-        .PARAMETER Name
-        Optional filter by policy name
+    .PARAMETER Name
+    Optional filter by policy name.
 
-        .EXAMPLE
-        Get-DeviceConfigurationPolicy -Category "DeviceConfiguration"
-        Returns any device configuration policies configured in Intune
+    .EXAMPLE
+    Get-DeviceConfigurationPolicy -Category "DeviceConfiguration"
 
-        .EXAMPLE
-        Get-DeviceConfigurationPolicy -Category "DeviceConfigurationSC" -name "Security Baseline"
-        Returns Settings Catalog policies with the specified name
-        
-        .NOTES
-        NAME: Get-DeviceConfigurationPolicy
-        Author: Hailey Phillips
-        Version: 0.0.1
-        Modified: 2025-07-23
+    .EXAMPLE
+    Get-DeviceConfigurationPolicy -Category "DeviceConfigurationSC" -Name "Security Baseline"
 
-        Adapted from Intune management functions by Andrew Taylor (https://github.com/andrew-s-taylor/public).
+    .NOTES
+    NAME: Get-DeviceConfigurationPolicy
     #>
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $false)]
-        $Name,
-
         [Parameter(Mandatory = $true)]
-        [ValidateSet('AutopilotProfile', 'ApplicationProtection', 'ConditionalAccess', 'CompliancePolicies', 'DeviceConfiguration', 'DeviceConfigurationSC', '*')]
-        [string]$Category
+        [ValidateSet('AutopilotProfile', 'ApplicationProtection', 'ConditionalAccess', 'CompliancePolicies', 'DeviceConfiguration', 'DeviceConfigurationSC')]
+        [string]$Category,
 
+        [Parameter(Mandatory = $false)]
+        [string]$Name
     )
 
     $graphApiVersion = "beta"
 
-    # Dynamically setting Graph resource path based off of category
     $DCP_resource = switch ($Category) {
         'AutopilotProfile' { "deviceManagement/windowsAutopilotDeploymentProfiles" }
         'ApplicationProtection' { "deviceAppManagement/managedAppPolicies" }
@@ -56,7 +47,6 @@ function Get-DeviceConfigurationPolicy {
         'ConditionalAccess' { "identity/conditionalAccess/policies" }
         'DeviceConfiguration' { "deviceManagement/deviceConfigurations" }
         'DeviceConfigurationSC' { "deviceManagement/configurationPolicies" }
-        default { throw "Unknown category: $Category" }
     }
 
     $displayNameProperty = switch ($Category) {
@@ -64,25 +54,31 @@ function Get-DeviceConfigurationPolicy {
         default { 'displayName' }
     }
 
-    try {
-        if ($Name) {
-            $uri = "https://graph.microsoft.com/$graphApiVersion/$($DCP_resource)?`$filter=$displayNameProperty eq '$name'"
-            (Invoke-MgGraphRequest -Uri $uri -Method Get -OutputType PSObject).Value
-        } else {
-            $uri = "https://graph.microsoft.com/$graphApiVersion/$($DCP_resource)"
-            (Invoke-MgGraphRequest -Uri $uri -Method Get -OutputType PSObject).Value
-        }
-    } catch {
-        $ex = $_.Exception
-        $errorResponse = $ex.Response.GetResponseStream()
-        $reader = New-Object System.IO.StreamReader($errorResponse)
-        $reader.BaseStream.Position = 0
-        $reader.DiscardBufferedData()
-        $responseBody = $reader.ReadToEnd();
-        Write-Host "Response content:`n$responseBody" -f Red
-        Write-Error "Request to $Uri failed with HTTP Status $($ex.Response.StatusCode) $($ex.Response.StatusDescription)"
-        Write-Host
-        break
+    $graphParams = @{
+        Uri        = "https://graph.microsoft.com/$graphApiVersion/$DCP_resource"
+        Method     = "GET"
+        OutputType = "PSObject"
     }
 
-} # end function et-DeviceConfigurationPolicy
+    try {
+        $result = (Invoke-MgGraphRequest @graphParams).Value
+
+        if ($Name) {
+            $result = $result | Where-Object { $_.$displayNameProperty -eq $Name }
+            if ($result) {
+                Write-Log -Message "Found policy: $Name" -Severity Info
+            } else {
+                Write-Log -Message "Policy not found: $Name" -Severity Warn
+            }
+        } else {
+            Write-Log -Message "Found $($result.Count) $Category policies" -Severity Info
+        }
+
+        return $result
+
+    } catch {
+        Write-Log -Message "Error retrieving $Category policies" -Severity Error
+        throw
+    }
+
+} # end function Get-DeviceConfigurationPolicy
